@@ -15,6 +15,28 @@ from pathlib import Path
 
 
 APP_NAME = "daylist"
+COMMAND_LINES = [
+    ("WIDGET KEYS", True),
+    ("↑ / ↓ or j / k    Move selection", False),
+    ("Space / Enter  Toggle; add on add row", False),
+    ("a                 Add task", False),
+    ("e                 Edit selected task", False),
+    ("x                 Delete selected task", False),
+    ("? or h            Show or close commands", False),
+    ("Esc               Close commands or quit widget", False),
+    ("q                 Quit widget", False),
+    ("", False),
+    ("TERMINAL COMMANDS", True),
+    ("daylist           Open the widget", False),
+    ("daylist ui        Open the widget", False),
+    ("daylist add TEXT  Add a task", False),
+    ("daylist done N    Complete task N", False),
+    ("daylist undo N    Reopen task N", False),
+    ("daylist remove N  Delete task N", False),
+    ("daylist list      Show tasks and progress", False),
+    ("daylist commands  Show all commands", False),
+    ("daylist --help    Show command syntax", False),
+]
 DATA_FILE = Path(
     os.environ.get(
         "DAYLIST_DATA_FILE",
@@ -133,6 +155,11 @@ def cli_list(data):
     for label, value in (("Yesterday", yesterday), (f"Daily average · {days} day{'s' if days != 1 else ''}", daily_average)):
         percentage = "—" if value is None else f"{value:.0%}"
         print(f"{label:<24} {bar(value, 20)} {percentage}")
+
+
+def cli_commands():
+    for line, _ in COMMAND_LINES:
+        print(line)
 
 
 def setup_colors():
@@ -261,8 +288,41 @@ def render(screen, data, selected, message=""):
         put(screen, header_y, left + panel_width - 2 - len(percentage), percentage, style=color(2))
         put(screen, header_y + 1, x, bar(value, inner), style=color(2) if value is not None else curses.A_DIM)
 
-    footer = message or "↑↓ move   space toggle   a add   e edit   x delete   q quit"
+    footer = message or "? commands  ↑↓ move  Space toggle  q quit"
     put(screen, top + panel_height - 2, x, footer, inner, color(4) if message else curses.A_DIM)
+    screen.refresh()
+
+
+def render_commands(screen, scroll):
+    screen.erase()
+    height, width = screen.getmaxyx()
+    if height < 10 or width < 40:
+        put(screen, 1, 2, "Enlarge the terminal to view commands.")
+        put(screen, 3, 2, "Esc back · q quit")
+        screen.refresh()
+        return
+
+    panel_width = min(74, width - 4)
+    panel_height = min(24, height - 2)
+    left = (width - panel_width) // 2
+    top = (height - panel_height) // 2
+    inner = panel_width - 4
+    visible = panel_height - 5
+    scroll = min(scroll, max(0, len(COMMAND_LINES) - visible))
+
+    put(screen, top, left, "╭" + "─" * (panel_width - 2) + "╮", style=color(1))
+    for y in range(top + 1, top + panel_height - 1):
+        put(screen, y, left, "│", style=color(1))
+        put(screen, y, left + panel_width - 1, "│", style=color(1))
+    put(screen, top + panel_height - 1, left, "╰" + "─" * (panel_width - 2) + "╯", style=color(1))
+
+    x = left + 2
+    put(screen, top + 1, x, "◈ ALL COMMANDS", style=color(1) | curses.A_BOLD)
+    for row, (line, heading) in enumerate(COMMAND_LINES[scroll:scroll + visible]):
+        style = color(1) | curses.A_BOLD if heading else curses.A_NORMAL
+        put(screen, top + 3 + row, x, line, inner, style)
+    footer = "↑↓ scroll   ? / Esc back   q quit"
+    put(screen, top + panel_height - 2, x, footer, inner, curses.A_DIM)
     screen.refresh()
 
 
@@ -273,7 +333,23 @@ def dashboard(screen):
         curses.curs_set(0)
     selected = 0
     message = ""
+    showing_commands = False
+    help_scroll = 0
     while True:
+        if showing_commands:
+            render_commands(screen, help_scroll)
+            key = screen.get_wch()
+            if key in ("q", "Q"):
+                break
+            if key in ("?", "h", "H", "\x1b", "\n", "\r", curses.KEY_ENTER):
+                showing_commands = False
+            elif key in (curses.KEY_DOWN, "j"):
+                visible = max(1, min(24, screen.getmaxyx()[0] - 2) - 5)
+                help_scroll = min(help_scroll + 1, max(0, len(COMMAND_LINES) - visible))
+            elif key in (curses.KEY_UP, "k"):
+                help_scroll = max(0, help_scroll - 1)
+            continue
+
         data = read_data()
         tasks = tasks_for(data)
         selected = min(selected, len(tasks))
@@ -282,7 +358,10 @@ def dashboard(screen):
         key = screen.get_wch()
         if key in ("q", "Q", "\x1b"):
             break
-        if key in (curses.KEY_UP, "k"):
+        if key in ("?", "h", "H"):
+            showing_commands = True
+            help_scroll = 0
+        elif key in (curses.KEY_UP, "k"):
             selected = max(0, selected - 1)
         elif key in (curses.KEY_DOWN, "j"):
             selected = min(len(tasks), selected + 1)
@@ -304,7 +383,7 @@ def dashboard(screen):
         elif key == curses.KEY_RESIZE:
             continue
         else:
-            message = "Use ↑↓ to select, then space to check off a task."
+            message = "Press ? to view all commands."
 
 
 def main():
@@ -316,6 +395,7 @@ def main():
         command = commands.add_parser(name, help=f"{name} a numbered task")
         command.add_argument("number", type=int)
     commands.add_parser("list", help="print today's tasks and progress")
+    commands.add_parser("commands", help="print all terminal commands and widget keys")
     commands.add_parser("ui", help="open the interactive dashboard")
     args = parser.parse_args()
     try:
@@ -328,6 +408,8 @@ def main():
             print(f"{verb} task {args.number}.")
         elif args.command == "list":
             cli_list(read_data())
+        elif args.command == "commands":
+            cli_commands()
         else:
             if not sys.stdin.isatty() or not sys.stdout.isatty():
                 parser.error("interactive mode needs a terminal; use 'daylist list' here")

@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""A small, dependency-free daily task dashboard for the terminal."""
+
+import argparse
+import contextlib
+import curses
+import datetime as dt
+import fcntl
+import json
+import os
+import sys
+import tempfile
+import uuid
+from pathlib import Path
+
+
+APP_NAME = "daylist"
+DATA_FILE = Path(
+    os.environ.get(
+        "DAYLIST_DATA_FILE",
+        str(Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / APP_NAME / "tasks.json"),
+    )
+).expanduser()
+
+
+def today_key():
+    return dt.date.today().isoformat()
+
+
+def read_data():
+    if not DATA_FILE.exists():
+        return {"version": 1, "days": {}}
+    with DATA_FILE.open(encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict) or not isinstance(data.get("days"), dict):
+        raise ValueError(f"Invalid task data in {DATA_FILE}")
+    return data
+
+
+def write_data(data):
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=DATA_FILE.parent, prefix=".tasks-", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            os.chmod(temporary, 0o600)
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, DATA_FILE)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def change_data(change):
+    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with (DATA_FILE.parent / ".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = read_data()
+        result = change(data)
+        write_data(data)
+        return result
+
+
+def tasks_for(data, day=None):
+    return data["days"].get(day or today_key(), [])
+
+
+def add_task(text):
+    text = " ".join(text.split()).strip()
+    if not text:
+        raise ValueError("Task text cannot be empty")
+
+    def change(data):
+        tasks = data["days"].setdefault(today_key(), [])
+        tasks.append({"id": uuid.uuid4().hex, "text": text, "done": False})
+        return len(tasks)
+
+    return change_data(change)
+
+
+def update_task(index, action, text=None):
+    def change(data):
+        tasks = tasks_for(data)
+        if index < 1 or index > len(tasks):
+            raise ValueError(f"Task {index} does not exist today")
+        if action == "remove":
+            tasks.pop(index - 1)
+        elif action == "edit":
+            cleaned = " ".join(text.split()).strip()
+            if not cleaned:
+                raise ValueError("Task text cannot be empty")
+            tasks[index - 1]["text"] = cleaned
+        else:
+            tasks[index - 1]["done"] = action == "done"
+
+    change_data(change)
+
+
+def progress(tasks):
+    if not tasks:
+        return None
+    return sum(bool(task["done"]) for task in tasks) / len(tasks)
+
+
+def average(data):
+    values = [progress(tasks) for tasks in data["days"].values() if tasks]
+    return (sum(values) / len(values), len(values)) if values else (None, 0)
+
+
+def bar(fraction, width):
+    if fraction is None:
+        return "░" * width
+    filled = round(fraction * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def cli_list(data):
+    tasks = tasks_for(data)
+    print(f"TODAY · {dt.date.today():%A, %d %B %Y}")
+    if tasks:
+        for index, task in enumerate(tasks, 1):
+            print(f"{index:2}. {'✓' if task['done'] else '○'} {task['text']}")
+    else:
+        print("No tasks yet. Add one with: daylist add Your task")
+    print()
+    yesterday = progress(tasks_for(data, (dt.date.today() - dt.timedelta(days=1)).isoformat()))
+    daily_average, days = average(data)
+    for label, value in (("Yesterday", yesterday), (f"Daily average · {days} day{'s' if days != 1 else ''}", daily_average)):
+        percentage = "—" if value is None else f"{value:.0%}"
+        print(f"{label:<24} {bar(value, 20)} {percentage}")
+
+
+def setup_colors():
+    if not curses.has_colors():
+        return
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_GREEN, -1)
+    curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_CYAN)
+    curses.init_pair(4, curses.COLOR_YELLOW, -1)
+
+
+def color(number):
+    return curses.color_pair(number) if curses.has_colors() else curses.A_NORMAL
+
+
+def put(screen, y, x, value, limit=None, style=0):
+    if limit is not None:
+        value = value[:limit]
+    try:
+        screen.addstr(y, x, value, style)
+    except curses.error:
+        pass
+
+
+def prompt(screen, label, initial=""):
+    height, width = screen.getmaxyx()
+    if height < 4 or width < 24:
+        return None
+    y = height - 2
+    put(screen, y, 2, " " * (width - 4))
+    put(screen, y, 2, label, width - 6, color(1) | curses.A_BOLD)
+    x = min(width - 3, 3 + len(label))
+    value = list(initial)
+    with contextlib.suppress(curses.error):
+        curses.curs_set(1)
+    try:
+        while True:
+            available = width - x - 3
+            shown = "".join(value)[-available:] if available > 0 else ""
+            put(screen, y, x, " " * max(0, width - x - 2))
+            put(screen, y, x, shown, available)
+            screen.move(y, min(width - 2, x + len(shown)))
+            screen.refresh()
+            key = screen.get_wch()
+            if key in ("\n", "\r", curses.KEY_ENTER):
+                return "".join(value).strip()
+            if key in ("\x1b",):
+                return None
+            if key in ("\b", "\x7f", curses.KEY_BACKSPACE):
+                if value:
+                    value.pop()
+            elif isinstance(key, str) and key.isprintable() and len(value) < 500:
+                value.append(key)
+    finally:
+        with contextlib.suppress(curses.error):
+            curses.curs_set(0)
+
+
+def render(screen, data, selected, message=""):
+    screen.erase()
+    height, width = screen.getmaxyx()
+    if height < 20 or width < 48:
+        put(screen, 1, 2, "Make your terminal at least 48 × 20 to show Daylist.")
+        put(screen, 3, 2, "Press q to quit.")
+        screen.refresh()
+        return
+
+    tasks = tasks_for(data)
+    panel_width = min(74, width - 4)
+    panel_height = min(height - 2, max(19, 17 + min(len(tasks), 9)))
+    left = (width - panel_width) // 2
+    top = (height - panel_height) // 2
+    inner = panel_width - 4
+    visible = panel_height - 15
+
+    put(screen, top, left, "╭" + "─" * (panel_width - 2) + "╮", style=color(1))
+    for y in range(top + 1, top + panel_height - 1):
+        put(screen, y, left, "│", style=color(1))
+        put(screen, y, left + panel_width - 1, "│", style=color(1))
+    put(screen, top + panel_height - 1, left, "╰" + "─" * (panel_width - 2) + "╯", style=color(1))
+
+    x = left + 2
+    put(screen, top + 1, x, "◈ DAYLIST", style=color(1) | curses.A_BOLD)
+    date_label = dt.date.today().strftime("%a, %d %b %Y").upper()
+    put(screen, top + 1, left + panel_width - 2 - len(date_label), date_label, style=curses.A_DIM)
+
+    completed = sum(bool(task["done"]) for task in tasks)
+    put(screen, top + 3, x, "TODAY", style=curses.A_BOLD)
+    count = f"{completed} / {len(tasks)} done"
+    put(screen, top + 3, left + panel_width - 2 - len(count), count, style=color(2))
+    put(screen, top + 4, x, "─" * inner, style=curses.A_DIM)
+
+    scroll = max(0, min(selected - visible + 1, max(0, len(tasks) - visible))) if selected < len(tasks) else max(0, len(tasks) - visible)
+    if not tasks:
+        put(screen, top + 5, x + 2, "A clear day. Add your first task below.", inner - 4, curses.A_DIM)
+    for row, index in enumerate(range(scroll, min(len(tasks), scroll + visible))):
+        task = tasks[index]
+        line = f" {index + 1:02}  {'●' if task['done'] else '○'}  {task['text']}"
+        style = color(3) | curses.A_BOLD if index == selected else (curses.A_DIM if task["done"] else curses.A_NORMAL)
+        if index == selected:
+            put(screen, top + 5 + row, x, " " * inner, style=style)
+        put(screen, top + 5 + row, x, line, inner, style)
+    if len(tasks) > visible:
+        indicator = f"{scroll + 1}–{min(len(tasks), scroll + visible)} / {len(tasks)}"
+        put(screen, top + 4, left + panel_width - 2 - len(indicator), indicator, style=color(1))
+
+    add_y = top + 5 + visible
+    add_label = " +  Add another task"
+    if selected == len(tasks):
+        put(screen, add_y, x, " " * inner, style=color(3))
+        put(screen, add_y, x, add_label, style=color(3) | curses.A_BOLD)
+    else:
+        put(screen, add_y, x, add_label, style=color(1))
+
+    yesterday = progress(tasks_for(data, (dt.date.today() - dt.timedelta(days=1)).isoformat()))
+    daily_average, days = average(data)
+    for offset, label, value in (
+        (2, "YESTERDAY", yesterday),
+        (5, f"DAILY AVERAGE  ·  {days} day{'s' if days != 1 else ''}", daily_average),
+    ):
+        header_y = add_y + offset
+        put(screen, header_y, x, label, style=curses.A_BOLD)
+        percentage = "—" if value is None else f"{value:.0%}"
+        put(screen, header_y, left + panel_width - 2 - len(percentage), percentage, style=color(2))
+        put(screen, header_y + 1, x, bar(value, inner), style=color(2) if value is not None else curses.A_DIM)
+
+    footer = message or "↑↓ move   space toggle   a add   e edit   x delete   q quit"
+    put(screen, top + panel_height - 2, x, footer, inner, color(4) if message else curses.A_DIM)
+    screen.refresh()
+
+
+def dashboard(screen):
+    setup_colors()
+    screen.keypad(True)
+    with contextlib.suppress(curses.error):
+        curses.curs_set(0)
+    selected = 0
+    message = ""
+    while True:
+        data = read_data()
+        tasks = tasks_for(data)
+        selected = min(selected, len(tasks))
+        render(screen, data, selected, message)
+        message = ""
+        key = screen.get_wch()
+        if key in ("q", "Q", "\x1b"):
+            break
+        if key in (curses.KEY_UP, "k"):
+            selected = max(0, selected - 1)
+        elif key in (curses.KEY_DOWN, "j"):
+            selected = min(len(tasks), selected + 1)
+        elif key in ("a", "A") or (selected == len(tasks) and key in (" ", "\n", "\r", curses.KEY_ENTER)):
+            text = prompt(screen, "New task: ")
+            if text:
+                selected = add_task(text) - 1
+        elif selected < len(tasks) and key in (" ", "\n", "\r", curses.KEY_ENTER):
+            update_task(selected + 1, "undo" if tasks[selected]["done"] else "done")
+        elif selected < len(tasks) and key in ("e", "E"):
+            text = prompt(screen, "Edit task: ", tasks[selected]["text"])
+            if text:
+                update_task(selected + 1, "edit", text)
+        elif selected < len(tasks) and key in ("x", "X"):
+            answer = prompt(screen, "Delete task? y/N: ")
+            if answer and answer.lower() == "y":
+                update_task(selected + 1, "remove")
+                selected = min(selected, len(tasks) - 1)
+        elif key == curses.KEY_RESIZE:
+            continue
+        else:
+            message = "Use ↑↓ to select, then space to check off a task."
+
+
+def main():
+    parser = argparse.ArgumentParser(description="A daily task dashboard for your terminal")
+    commands = parser.add_subparsers(dest="command")
+    add = commands.add_parser("add", help="add a task to today")
+    add.add_argument("text", nargs="+", help="task description")
+    for name in ("done", "undo", "remove"):
+        command = commands.add_parser(name, help=f"{name} a numbered task")
+        command.add_argument("number", type=int)
+    commands.add_parser("list", help="print today's tasks and progress")
+    commands.add_parser("ui", help="open the interactive dashboard")
+    args = parser.parse_args()
+    try:
+        if args.command == "add":
+            number = add_task(" ".join(args.text))
+            print(f"Added task {number}.")
+        elif args.command in ("done", "undo", "remove"):
+            update_task(args.number, args.command)
+            verb = {"done": "Completed", "undo": "Reopened", "remove": "Removed"}[args.command]
+            print(f"{verb} task {args.number}.")
+        elif args.command == "list":
+            cli_list(read_data())
+        else:
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                parser.error("interactive mode needs a terminal; use 'daylist list' here")
+            curses.wrapper(dashboard)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.exit(1, f"daylist: {error}\n")
+    except KeyboardInterrupt:
+        # curses.wrapper restores the terminal before the interrupt reaches here.
+        return
+
+
+if __name__ == "__main__":
+    main()

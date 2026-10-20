@@ -45,6 +45,20 @@ daylist --help
 
 `daylist commands` prints every terminal command and widget shortcut. The commands view inside the widget scrolls with the arrow keys and closes with `?`, `h`, Enter, or Esc.
 
+## GitHub and LeetCode activity
+
+Add your public usernames from the terminal:
+
+```sh
+daylist github YOUR_GITHUB_USERNAME
+daylist leetcode YOUR_LEETCODE_USERNAME
+daylist
+```
+
+In the widget, press `g` or `l` to enter or change the respective username; submit a blank value to clear it. Press `r` to refresh both graphs. You can also run `daylist github --clear` or `daylist leetcode --clear`. The `daylist list` command prints the activity totals and compact graphs too.
+
+Each count covers the last 365 days. On tall terminals, the widget shows daily calendar graphs; on shorter terminals it shows weekly activity strips. Narrow terminals show the most recent weeks. Daylist fetches public GitHub contributions and LeetCode submission calendars directly, caches each account for 15 minutes alongside the task file, and shows cached data if a refresh fails. Network access is needed for the first fetch. GitHub's count follows the contributions visible on the public profile, including private contribution counts only when that account shares them.
+
 Yesterday's bar shows the portion of yesterday's tasks completed. Daily average is the mean completion rate across all saved days that contain tasks, including today. Days with no tasks are excluded.
 
 Data is saved to `~/.local/share/daylist/tasks.json` by default. Set `XDG_DATA_HOME` or `DAYLIST_DATA_FILE` to change the location.

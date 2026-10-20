@@ -6,10 +6,16 @@ import contextlib
 import curses
 import datetime as dt
 import fcntl
+from html.parser import HTMLParser
 import json
 import os
+import re
 import sys
 import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -22,6 +28,8 @@ COMMAND_LINES = [
     ("a                 Add task", False),
     ("e                 Edit selected task", False),
     ("x                 Delete selected task", False),
+    ("g / l             Set GitHub / LeetCode username", False),
+    ("r                 Refresh activity graphs", False),
     ("? or h            Show or close commands", False),
     ("Esc               Close commands or quit widget", False),
     ("q                 Quit widget", False),
@@ -34,6 +42,10 @@ COMMAND_LINES = [
     ("daylist undo N    Reopen task N", False),
     ("daylist remove N  Delete task N", False),
     ("daylist list      Show tasks and progress", False),
+    ("daylist github USERNAME    Set GitHub account", False),
+    ("daylist leetcode USERNAME  Set LeetCode account", False),
+    ("daylist github --clear   Remove GitHub account", False),
+    ("daylist leetcode --clear Remove LeetCode account", False),
     ("daylist commands  Show all commands", False),
     ("daylist --help    Show command syntax", False),
 ]
@@ -43,6 +55,11 @@ DATA_FILE = Path(
         str(Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / APP_NAME / "tasks.json"),
     )
 ).expanduser()
+ACTIVITY_TTL = 15 * 60
+PROVIDERS = ("github", "leetcode")
+PROVIDER_NAMES = {"github": "GitHub", "leetcode": "LeetCode"}
+GITHUB_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?\Z")
+LEETCODE_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}\Z")
 
 
 def today_key():
@@ -51,11 +68,14 @@ def today_key():
 
 def read_data():
     if not DATA_FILE.exists():
-        return {"version": 1, "days": {}}
+        return {"version": 1, "days": {}, "accounts": {}}
     with DATA_FILE.open(encoding="utf-8") as stream:
         data = json.load(stream)
     if not isinstance(data, dict) or not isinstance(data.get("days"), dict):
         raise ValueError(f"Invalid task data in {DATA_FILE}")
+    data.setdefault("accounts", {})
+    if not isinstance(data["accounts"], dict):
+        raise ValueError(f"Invalid accounts in {DATA_FILE}")
     return data
 
 
@@ -86,6 +106,173 @@ def change_data(change):
         result = change(data)
         write_data(data)
         return result
+
+
+def set_account(provider, username):
+    if username and not (GITHUB_NAME if provider == "github" else LEETCODE_NAME).fullmatch(username):
+        raise ValueError(f"Invalid {provider} username")
+
+    def change(data):
+        if username:
+            data["accounts"][provider] = username
+        else:
+            data["accounts"].pop(provider, None)
+
+    change_data(change)
+
+
+class ContributionParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.dates = {}
+        self.counts = {}
+        self.tooltip_for = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "td" and attrs.get("data-date") and attrs.get("id"):
+            self.dates[attrs["id"]] = attrs["data-date"]
+        elif tag == "tool-tip":
+            self.tooltip_for = attrs.get("for")
+
+    def handle_data(self, data):
+        if self.tooltip_for:
+            match = re.match(r"([\d,]+) contributions?\b", data.strip())
+            if match:
+                self.counts[self.tooltip_for] = int(match.group(1).replace(",", ""))
+            elif data.strip().startswith("No contributions"):
+                self.counts[self.tooltip_for] = 0
+
+    def handle_endtag(self, tag):
+        if tag == "tool-tip":
+            self.tooltip_for = None
+
+
+def fetch_activity(provider, username):
+    if provider == "github":
+        request = urllib.request.Request(
+            f"https://github.com/users/{username}/contributions",
+            headers={"User-Agent": "Daylist/1.0", "Accept": "text/html"},
+        )
+        with urllib.request.urlopen(request, timeout=8) as response:
+            parser = ContributionParser()
+            parser.feed(response.read().decode("utf-8"))
+        if not parser.dates or len(parser.counts) < len(parser.dates):
+            raise ValueError("GitHub returned an unreadable contribution graph")
+        days = {day: parser.counts[cell_id] for cell_id, day in parser.dates.items()}
+    else:
+        year = dt.date.today().year
+        query = ("query($username: String!) { matchedUser(username: $username) { "
+                 f"current: userCalendar(year: {year}) {{ submissionCalendar }} "
+                 f"previous: userCalendar(year: {year - 1}) {{ submissionCalendar }} "
+                 "} }")
+        request = urllib.request.Request(
+            "https://leetcode.com/graphql",
+            data=json.dumps({"query": query, "variables": {"username": username}}).encode(),
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0", "Referer": "https://leetcode.com/"},
+        )
+        with urllib.request.urlopen(request, timeout=8) as response:
+            payload = json.load(response)
+        user = payload.get("data", {}).get("matchedUser")
+        if not user:
+            raise ValueError("LeetCode user not found or calendar unavailable")
+        days = {}
+        for field in ("previous", "current"):
+            calendar = json.loads(user[field]["submissionCalendar"] or "{}")
+            for stamp, count in calendar.items():
+                day = dt.datetime.fromtimestamp(int(stamp), dt.timezone.utc).date().isoformat()
+                days[day] = int(count)
+    today = dt.date.today()
+    first = today - dt.timedelta(days=364)
+    days = {day: count for day, count in days.items() if first.isoformat() <= day <= today.isoformat()}
+    return {"days": days, "total": sum(days.values())}
+
+
+def cache_path(provider):
+    return DATA_FILE.with_name(f"{DATA_FILE.stem}-{provider}-activity.json")
+
+
+def read_activity_cache(provider, username):
+    try:
+        with cache_path(provider).open(encoding="utf-8") as stream:
+            cache = json.load(stream)
+        activity = cache.get("activity")
+        if (cache.get("username") == username and isinstance(cache.get("fetched"), (int, float))
+                and isinstance(activity, dict) and isinstance(activity.get("days"), dict)
+                and isinstance(activity.get("total"), int)):
+            return cache
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def write_activity_cache(provider, username, activity):
+    path = cache_path(provider)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=f".{provider}-activity-", delete=False) as stream:
+            temporary = Path(stream.name)
+            os.chmod(temporary, 0o600)
+            json.dump({"username": username, "fetched": time.time(), "activity": activity}, stream)
+            stream.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def activity_for_cli(provider, username):
+    cache = read_activity_cache(provider, username)
+    if cache and time.time() - cache.get("fetched", 0) < ACTIVITY_TTL:
+        return cache["activity"], ""
+    try:
+        activity = fetch_activity(provider, username)
+        write_activity_cache(provider, username, activity)
+        return activity, ""
+    except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError) as error:
+        return (cache["activity"] if cache else None), str(error)
+
+
+class ActivityState:
+    def __init__(self, accounts):
+        self.accounts = dict(accounts)
+        self.entries = {}
+        self.lock = threading.Lock()
+        for provider in PROVIDERS:
+            self.refresh(provider)
+
+    def refresh(self, provider, force=False):
+        username = self.accounts.get(provider)
+        if not username:
+            with self.lock:
+                self.entries[provider] = {"activity": None, "status": ""}
+            return
+        cache = read_activity_cache(provider, username)
+        activity = cache["activity"] if cache else None
+        if cache and not force and time.time() - cache.get("fetched", 0) < ACTIVITY_TTL:
+            with self.lock:
+                self.entries[provider] = {"activity": activity, "status": ""}
+            return
+        with self.lock:
+            self.entries[provider] = {"activity": activity, "status": "Loading…"}
+
+        def worker():
+            try:
+                result = fetch_activity(provider, username)
+                with self.lock:
+                    if self.accounts.get(provider) != username:
+                        return
+                    write_activity_cache(provider, username, result)
+                entry = {"activity": result, "status": ""}
+            except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError) as error:
+                entry = {"activity": activity, "status": f"Unavailable: {error}"}
+            with self.lock:
+                if self.accounts.get(provider) == username:
+                    self.entries[provider] = entry
+
+        threading.Thread(target=worker, daemon=True).start()
 
 
 def tasks_for(data, day=None):
@@ -141,6 +328,33 @@ def bar(fraction, width):
     return "█" * filled + "░" * (width - filled)
 
 
+def activity_level(count):
+    if count == 0:
+        return 0
+    if count < 2:
+        return 1
+    if count < 5:
+        return 2
+    if count < 10:
+        return 3
+    return 4
+
+
+def activity_columns(activity, weeks, rows):
+    today = dt.date.today()
+    first_day = today - dt.timedelta(days=364)
+    sunday = today - dt.timedelta(days=(today.weekday() + 1) % 7)
+    first = sunday - dt.timedelta(weeks=weeks - 1)
+    days = activity["days"] if activity else {}
+    if rows == 1:
+        return [[sum(days.get((first + dt.timedelta(days=7 * col + offset)).isoformat(), 0)
+                     for offset in range(7) if first_day <= first + dt.timedelta(days=7 * col + offset) <= today)
+                 for col in range(weeks)]]
+    return [[days.get((first + dt.timedelta(days=7 * col + row)).isoformat(), 0)
+             if first_day <= first + dt.timedelta(days=7 * col + row) <= today else None
+             for col in range(weeks)] for row in range(7)]
+
+
 def cli_list(data):
     tasks = tasks_for(data)
     print(f"TODAY · {dt.date.today():%A, %d %B %Y}")
@@ -155,6 +369,18 @@ def cli_list(data):
     for label, value in (("Yesterday", yesterday), (f"Daily average · {days} day{'s' if days != 1 else ''}", daily_average)):
         percentage = "—" if value is None else f"{value:.0%}"
         print(f"{label:<24} {bar(value, 20)} {percentage}")
+    for provider in PROVIDERS:
+        username = data["accounts"].get(provider)
+        print(f"\n{provider.upper()}" + (f" · @{username}" if username else " · not configured"))
+        if not username:
+            print(f"Set it with: daylist {provider} USERNAME")
+            continue
+        activity, error = activity_for_cli(provider, username)
+        if activity:
+            print(f"{activity['total']} {'contributions' if provider == 'github' else 'submissions'} in the last year")
+            print("".join("·░▒▓█"[activity_level(value)] for value in activity_columns(activity, 53, 1)[0]))
+        if error:
+            print(f"Using cached activity ({error})" if activity else f"Activity unavailable: {error}")
 
 
 def cli_commands():
@@ -186,6 +412,34 @@ def put(screen, y, x, value, limit=None, style=0):
         pass
 
 
+def draw_activity(screen, y, x, inner, provider, username, entry, rows):
+    label = provider.upper() + (f"  @{username}" if username else "")
+    activity = entry.get("activity") if entry else None
+    count = (f"{activity['total']} " + ("contributions" if provider == "github" else "submissions")) if activity else ""
+    if activity and entry.get("status", "").startswith("Unavailable"):
+        count += " · cached"
+    if not username:
+        count = f"{provider[0]} to set"
+    put(screen, y, x, label, max(0, inner - len(count) - 2), curses.A_BOLD)
+    put(screen, y, x + inner - len(count), count, style=color(2) if provider == "github" else color(1))
+    if not activity:
+        status = entry.get("status", "") if entry else ""
+        put(screen, y + 1, x + 2, status if username else f"Press {provider[0]} to enter a username", inner - 2, curses.A_DIM)
+        return
+    columns = activity_columns(activity, min(53, inner - (3 if rows == 7 else 0)), rows)
+    glyphs = "·░▒▓█"
+    for row, values in enumerate(columns):
+        offset = 3 if rows == 7 else 0
+        if rows == 7 and row in (1, 3, 5):
+            put(screen, y + 1 + row, x, ("Mo", "We", "Fr")[(row - 1) // 2], style=curses.A_DIM)
+        for col, value in enumerate(values):
+            if value is None:
+                continue
+            level = activity_level(value)
+            style = curses.A_DIM if level == 0 else color(2 if provider == "github" else 1)
+            put(screen, y + 1 + row, x + offset + col, glyphs[level], style=style)
+
+
 def prompt(screen, label, initial=""):
     height, width = screen.getmaxyx()
     if height < 4 or width < 24:
@@ -197,6 +451,7 @@ def prompt(screen, label, initial=""):
     value = list(initial)
     with contextlib.suppress(curses.error):
         curses.curs_set(1)
+    screen.timeout(-1)
     try:
         while True:
             available = width - x - 3
@@ -216,11 +471,12 @@ def prompt(screen, label, initial=""):
             elif isinstance(key, str) and key.isprintable() and len(value) < 500:
                 value.append(key)
     finally:
+        screen.timeout(250)
         with contextlib.suppress(curses.error):
             curses.curs_set(0)
 
 
-def render(screen, data, selected, message=""):
+def render(screen, data, selected, activity_state, message=""):
     screen.erase()
     height, width = screen.getmaxyx()
     if height < 20 or width < 48:
@@ -231,11 +487,13 @@ def render(screen, data, selected, message=""):
 
     tasks = tasks_for(data)
     panel_width = min(74, width - 4)
-    panel_height = min(height - 2, max(19, 17 + min(len(tasks), 9)))
+    graph_rows = 7 if height >= 36 else 1
+    graph_extra = 2 * (graph_rows - 1)
+    panel_height = min(height - 2, max(18 + graph_extra, 15 + graph_extra + min(len(tasks), 9)))
     left = (width - panel_width) // 2
     top = (height - panel_height) // 2
     inner = panel_width - 4
-    visible = panel_height - 15
+    visible = panel_height - 15 - graph_extra
 
     put(screen, top, left, "╭" + "─" * (panel_width - 2) + "╮", style=color(1))
     for y in range(top + 1, top + panel_height - 1):
@@ -249,26 +507,26 @@ def render(screen, data, selected, message=""):
     put(screen, top + 1, left + panel_width - 2 - len(date_label), date_label, style=curses.A_DIM)
 
     completed = sum(bool(task["done"]) for task in tasks)
-    put(screen, top + 3, x, "TODAY", style=curses.A_BOLD)
+    put(screen, top + 2, x, "TODAY", style=curses.A_BOLD)
     count = f"{completed} / {len(tasks)} done"
-    put(screen, top + 3, left + panel_width - 2 - len(count), count, style=color(2))
-    put(screen, top + 4, x, "─" * inner, style=curses.A_DIM)
+    put(screen, top + 2, left + panel_width - 2 - len(count), count, style=color(2))
+    put(screen, top + 3, x, "─" * inner, style=curses.A_DIM)
 
     scroll = max(0, min(selected - visible + 1, max(0, len(tasks) - visible))) if selected < len(tasks) else max(0, len(tasks) - visible)
     if not tasks:
-        put(screen, top + 5, x + 2, "A clear day. Add your first task below.", inner - 4, curses.A_DIM)
+        put(screen, top + 4, x + 2, "A clear day. Add your first task below.", inner - 4, curses.A_DIM)
     for row, index in enumerate(range(scroll, min(len(tasks), scroll + visible))):
         task = tasks[index]
         line = f" {index + 1:02}  {'●' if task['done'] else '○'}  {task['text']}"
         style = color(3) | curses.A_BOLD if index == selected else (curses.A_DIM if task["done"] else curses.A_NORMAL)
         if index == selected:
-            put(screen, top + 5 + row, x, " " * inner, style=style)
-        put(screen, top + 5 + row, x, line, inner, style)
+            put(screen, top + 4 + row, x, " " * inner, style=style)
+        put(screen, top + 4 + row, x, line, inner, style)
     if len(tasks) > visible:
         indicator = f"{scroll + 1}–{min(len(tasks), scroll + visible)} / {len(tasks)}"
-        put(screen, top + 4, left + panel_width - 2 - len(indicator), indicator, style=color(1))
+        put(screen, top + 3, left + panel_width - 2 - len(indicator), indicator, style=color(1))
 
-    add_y = top + 5 + visible
+    add_y = top + 4 + visible
     add_label = " +  Add another task"
     if selected == len(tasks):
         put(screen, add_y, x, " " * inner, style=color(3))
@@ -279,8 +537,8 @@ def render(screen, data, selected, message=""):
     yesterday = progress(tasks_for(data, (dt.date.today() - dt.timedelta(days=1)).isoformat()))
     daily_average, days = average(data)
     for offset, label, value in (
-        (2, "YESTERDAY", yesterday),
-        (5, f"DAILY AVERAGE  ·  {days} day{'s' if days != 1 else ''}", daily_average),
+        (1, "YESTERDAY", yesterday),
+        (3, f"DAILY AVERAGE  ·  {days} day{'s' if days != 1 else ''}", daily_average),
     ):
         header_y = add_y + offset
         put(screen, header_y, x, label, style=curses.A_BOLD)
@@ -288,7 +546,14 @@ def render(screen, data, selected, message=""):
         put(screen, header_y, left + panel_width - 2 - len(percentage), percentage, style=color(2))
         put(screen, header_y + 1, x, bar(value, inner), style=color(2) if value is not None else curses.A_DIM)
 
-    footer = message or "? commands  ↑↓ move  Space toggle  q quit"
+    github_y = add_y + 5
+    with activity_state.lock:
+        entries = dict(activity_state.entries)
+    draw_activity(screen, github_y, x, inner, "github", data["accounts"].get("github"), entries.get("github"), graph_rows)
+    leetcode_y = github_y + 1 + graph_rows
+    draw_activity(screen, leetcode_y, x, inner, "leetcode", data["accounts"].get("leetcode"), entries.get("leetcode"), graph_rows)
+
+    footer = message or "? help  g/l accounts  r refresh  ↑↓ move  Space toggle  q quit"
     put(screen, top + panel_height - 2, x, footer, inner, color(4) if message else curses.A_DIM)
     screen.refresh()
 
@@ -329,16 +594,21 @@ def render_commands(screen, scroll):
 def dashboard(screen):
     setup_colors()
     screen.keypad(True)
+    screen.timeout(250)
     with contextlib.suppress(curses.error):
         curses.curs_set(0)
     selected = 0
     message = ""
     showing_commands = False
     help_scroll = 0
+    activity_state = ActivityState(read_data()["accounts"])
     while True:
         if showing_commands:
             render_commands(screen, help_scroll)
-            key = screen.get_wch()
+            try:
+                key = screen.get_wch()
+            except curses.error:
+                continue
             if key in ("q", "Q"):
                 break
             if key in ("?", "h", "H", "\x1b", "\n", "\r", curses.KEY_ENTER):
@@ -353,14 +623,30 @@ def dashboard(screen):
         data = read_data()
         tasks = tasks_for(data)
         selected = min(selected, len(tasks))
-        render(screen, data, selected, message)
+        render(screen, data, selected, activity_state, message)
         message = ""
-        key = screen.get_wch()
+        try:
+            key = screen.get_wch()
+        except curses.error:
+            continue
         if key in ("q", "Q", "\x1b"):
             break
         if key in ("?", "h", "H"):
             showing_commands = True
             help_scroll = 0
+        elif key in ("g", "G", "l", "L"):
+            provider = "github" if key.lower() == "g" else "leetcode"
+            username = prompt(screen, f"{PROVIDER_NAMES[provider]} username (blank clears): ", data["accounts"].get(provider, ""))
+            if username is not None:
+                try:
+                    set_account(provider, username)
+                    activity_state.accounts[provider] = username
+                    activity_state.refresh(provider)
+                except ValueError as error:
+                    message = str(error)
+        elif key in ("r", "R"):
+            for provider in PROVIDERS:
+                activity_state.refresh(provider, force=True)
         elif key in (curses.KEY_UP, "k"):
             selected = max(0, selected - 1)
         elif key in (curses.KEY_DOWN, "j"):
@@ -395,6 +681,10 @@ def main():
         command = commands.add_parser(name, help=f"{name} a numbered task")
         command.add_argument("number", type=int)
     commands.add_parser("list", help="print today's tasks and progress")
+    for provider in PROVIDERS:
+        command = commands.add_parser(provider, help=f"set or clear the {provider} username")
+        command.add_argument("username", nargs="?")
+        command.add_argument("--clear", action="store_true", help="remove the saved username")
     commands.add_parser("commands", help="print all terminal commands and widget keys")
     commands.add_parser("ui", help="open the interactive dashboard")
     args = parser.parse_args()
@@ -408,6 +698,11 @@ def main():
             print(f"{verb} task {args.number}.")
         elif args.command == "list":
             cli_list(read_data())
+        elif args.command in PROVIDERS:
+            if (args.clear and args.username) or (not args.clear and not args.username):
+                parser.error(f"use 'daylist {args.command} USERNAME' or 'daylist {args.command} --clear'")
+            set_account(args.command, "" if args.clear else args.username)
+            print(f"{PROVIDER_NAMES[args.command]} username {'cleared' if args.clear else 'set to ' + args.username}.")
         elif args.command == "commands":
             cli_commands()
         else:
